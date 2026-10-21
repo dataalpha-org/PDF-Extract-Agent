@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime data (uploaded PDFs and parse output)
+backend/data/
+
+# Frontend
+node_modules/
+dist/
