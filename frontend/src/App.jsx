@@ -1,30 +1,10 @@
-import { Component, useEffect, useRef, useState } from "react";
-import { deleteDoc, exportUrl, extract, listDocs, retryDoc, uploadDocs } from "./api.js";
-
-const FORMATS = [
-  ["table", "Table"],
-  ["paragraph", "Paragraph"],
-  ["bullets", "Bullet points"],
-  ["keyvalue", "Field: Value"],
-  ["json", "JSON"],
-  ["custom", "Custom…"],
-];
-
-// Document lifecycle: processing -> ready_text (quick text, extract works) -> ready (Docling tables).
-// Scanned PDFs skip ready_text. A Docling failure after ready_text keeps the quick text plus an error.
-const isUsable = (d) => d.status === "ready" || d.status === "ready_text";
-const isParsing = (d) => d.status === "processing" || (d.status === "ready_text" && !d.error);
-
-function statusText(d) {
-  if (d.status === "processing") return "Reading PDF…";
-  if (d.status === "ready_text") {
-    return d.error
-      ? `${d.pages} pages · quick text only. ${d.error}`
-      : `${d.pages} pages · quick text ready · Docling parsing tables…`;
-  }
-  if (d.status === "ready") return `${d.pages} pages · ${d.tables} tables · fully parsed`;
-  return `Error: ${d.error}`;
-}
+import { useEffect, useRef, useState } from "react";
+import { Plus, Sparkles } from "lucide-react";
+import { deleteDoc, extract, listDocs, retryDoc, uploadDocs } from "./api.js";
+import { isParsing, isUsable } from "./utils.js";
+import ExtractionCard from "./components/ExtractionCard.jsx";
+import Sidebar from "./components/Sidebar.jsx";
+import Toast from "./components/Toast.jsx";
 
 let nextId = 1;
 const newCard = () => ({
@@ -38,110 +18,24 @@ const newCard = () => ({
   error: "",
 });
 
-const cellText = (v) => (v !== null && typeof v === "object" ? JSON.stringify(v) : String(v ?? ""));
-
-// Claude is asked for rows as arrays, but sometimes returns objects keyed by column name.
-function toRow(columns, r) {
-  if (Array.isArray(r)) return r;
-  if (r !== null && typeof r === "object") return columns.map((c) => r[c]);
-  return [r];
-}
-
-function toCsv(columns, rows) {
-  const esc = (v) => `"${cellText(v).replace(/"/g, '""')}"`;
-  return [columns, ...rows].map((r) => r.map(esc).join(",")).join("\n");
-}
-
-function download(name, text, type) {
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([text], { type }));
-  a.download = name;
-  a.click();
-}
-
-// Keeps a malformed result from blanking the whole page; resets when a new result arrives.
-class ResultBoundary extends Component {
-  state = { failed: false };
-
-  static getDerivedStateFromError() {
-    return { failed: true };
-  }
-
-  componentDidUpdate(prev) {
-    if (prev.result !== this.props.result && this.state.failed) this.setState({ failed: false });
-  }
-
-  render() {
-    if (!this.state.failed) return this.props.children;
-    return (
-      <div className="result">
-        <div className="warn">This result could not be displayed. Raw answer:</div>
-        <pre className="text">{this.props.result?.text}</pre>
-      </div>
-    );
-  }
-}
-
-function Result({ result }) {
-  const d = result.data;
-  const isTable = result.format === "table" && d && Array.isArray(d.columns) && Array.isArray(d.rows);
-  const rows = isTable ? d.rows.map((r) => toRow(d.columns, r)) : [];
-  const copyText = isTable ? toCsv(d.columns, rows) : result.text;
-
-  return (
-    <div className="result">
-      {result.truncated && (
-        <div className="warn">Documents were too long and were truncated before extraction.</div>
-      )}
-      {result.warning && <div className="warn">{result.warning}</div>}
-      {isTable ? (
-        <div className="tablewrap">
-          <table>
-            <thead>
-              <tr>{d.columns.map((c, i) => <th key={i}>{cellText(c)}</th>)}</tr>
-            </thead>
-            <tbody>
-              {rows.map((r, i) => (
-                <tr key={i}>{r.map((c, j) => <td key={j}>{cellText(c)}</td>)}</tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      ) : (
-        <pre className="text">{result.text}</pre>
-      )}
-      <div className="actions">
-        <button onClick={() => navigator.clipboard.writeText(copyText)}>Copy</button>
-        {isTable && (
-          <button onClick={() => download("extract.csv", toCsv(d.columns, rows), "text/csv")}>
-            Download CSV
-          </button>
-        )}
-        {result.format === "json" && (
-          <button onClick={() => download("extract.json", result.text, "application/json")}>
-            Download JSON
-          </button>
-        )}
-        {!isTable && result.format !== "json" && (
-          <button onClick={() => download("extract.md", result.text, "text/markdown")}>
-            Download .md
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
 export default function App() {
   const [docs, setDocs] = useState([]);
   const [cards, setCards] = useState([newCard()]);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
-  const fileRef = useRef();
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef();
+
+  const notify = (msg, kind = "success") => {
+    clearTimeout(toastTimer.current);
+    setToast({ msg, kind });
+    toastTimer.current = setTimeout(() => setToast(null), 3000);
+  };
 
   const refresh = async () => {
     try {
       setDocs(await listDocs());
+      setError("");
     } catch (e) {
       setError(`Cannot reach backend: ${e.message}`);
     }
@@ -160,28 +54,21 @@ export default function App() {
 
   const onFiles = async (fileList) => {
     const files = [...fileList].filter((f) => f.name.toLowerCase().endsWith(".pdf"));
-    if (!files.length) return;
+    if (!files.length) return notify("Only PDF files can be uploaded.", "error");
     setUploading(true);
-    setError("");
     try {
       const added = (await uploadDocs(files)).map((d) => d.id);
       // Newly uploaded PDFs are selected in every request card right away.
       setCards((cs) => cs.map((c) => ({ ...c, docIds: [...c.docIds, ...added] })));
       await refresh();
+      notify(`Uploaded ${files.length} PDF${files.length > 1 ? "s" : ""}. Ready for questions in a moment.`);
     } catch (e) {
-      setError(e.message);
+      notify(e.message, "error");
     }
     setUploading(false);
   };
 
   const patch = (id, p) => setCards((cs) => cs.map((c) => (c.id === id ? { ...c, ...p } : c)));
-
-  const toggleDoc = (card, docId) =>
-    patch(card.id, {
-      docIds: card.docIds.includes(docId)
-        ? card.docIds.filter((x) => x !== docId)
-        : [...card.docIds, docId],
-    });
 
   const run = async (card) => {
     if (!card.instruction.trim()) return patch(card.id, { error: "Describe what to extract." });
@@ -210,158 +97,77 @@ export default function App() {
     for (const c of cards) await run(c);
   };
 
-  const remove = async (id) => {
-    setError("");
+  const remove = async (doc) => {
+    if (!window.confirm(`Delete "${doc.name}"? This removes the PDF and its parsed data.`)) return;
     try {
-      await deleteDoc(id);
-      setCards((cs) => cs.map((c) => ({ ...c, docIds: c.docIds.filter((x) => x !== id) })));
+      await deleteDoc(doc.id);
+      setCards((cs) => cs.map((c) => ({ ...c, docIds: c.docIds.filter((x) => x !== doc.id) })));
+      notify(`Deleted ${doc.name}`);
     } catch (e) {
-      setError(`Could not delete: ${e.message}`);
+      notify(`Could not delete: ${e.message}`, "error");
     }
     refresh();
   };
 
-  const retry = async (id) => {
-    setError("");
+  const retry = async (doc) => {
     try {
-      await retryDoc(id);
+      await retryDoc(doc.id);
+      notify(`Retrying ${doc.name}`);
     } catch (e) {
-      setError(`Could not retry: ${e.message}`);
+      notify(`Could not retry: ${e.message}`, "error");
     }
     refresh();
   };
 
-  // Parsing PDFs are listed too, so a fresh upload shows up (and is ticked) immediately.
+  // Parsing PDFs are listed too, so a fresh upload shows up (and is selected) immediately.
   const choosable = docs.filter((d) => d.status !== "error");
 
   return (
     <div className="app">
-      <aside>
-        <h1>PDF Extract Agent</h1>
-        <p className="sub">Docling parsing + Claude extraction</p>
+      <Sidebar
+        docs={docs}
+        uploading={uploading}
+        error={error}
+        onFiles={onFiles}
+        onRetry={retry}
+        onRemove={remove}
+      />
 
-        <div
-          className="drop"
-          onClick={() => fileRef.current.click()}
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            onFiles(e.dataTransfer.files);
-          }}
-        >
-          {uploading ? "Uploading…" : "Drop PDFs here or click to browse"}
-          <input
-            ref={fileRef}
-            type="file"
-            accept="application/pdf"
-            multiple
-            hidden
-            onChange={(e) => {
-              onFiles(e.target.files);
-              e.target.value = "";
-            }}
-          />
-        </div>
+      <main className="main">
+        <header className="page-head">
+          <h1>Extractions</h1>
+          <p>Describe what you need, pick PDFs and a format. Answers cite document and page.</p>
+        </header>
 
-        <ul className="files">
-          {docs.map((d) => (
-            <li key={d.id}>
-              <div>
-                <strong>{d.name}</strong>
-                {d.sample && <span className="badge">Sample</span>}
-                <small>
-                  {statusText(d)}
-                </small>
-              </div>
-              <div className="filebtns">
-                {d.status === "ready" && (
-                  <>
-                    <a href={exportUrl(d.id, "markdown")} target="_blank" rel="noreferrer">md</a>
-                    <a href={exportUrl(d.id, "json")} target="_blank" rel="noreferrer">json</a>
-                    <a href={exportUrl(d.id, "tables")} target="_blank" rel="noreferrer">tables</a>
-                  </>
-                )}
-                {d.error && <button onClick={() => retry(d.id)}>Retry</button>}
-                {!d.sample && (
-                  <button className="x" onClick={() => remove(d.id)} title="Remove">×</button>
-                )}
-              </div>
-            </li>
-          ))}
-          {!docs.length && <li className="empty">No PDFs yet.</li>}
-        </ul>
-        {error && <div className="warn">{error}</div>}
-      </aside>
-
-      <main>
         {cards.map((c, idx) => (
-          <section className="card" key={c.id}>
-            <div className="cardhead">
-              <h2>Extraction {idx + 1}</h2>
-              {cards.length > 1 && (
-                <button className="x" onClick={() => setCards((cs) => cs.filter((x) => x.id !== c.id))}>
-                  ×
-                </button>
-              )}
-            </div>
-
-            <label>What information do you want?</label>
-            <textarea
-              rows={3}
-              placeholder="e.g. Invoice number, total amount, due date, vendor name"
-              value={c.instruction}
-              onChange={(e) => patch(c.id, { instruction: e.target.value })}
-            />
-
-            <label>From which PDFs?</label>
-            <div className="checks">
-              {choosable.length === 0 && <span className="muted">Upload a PDF to get started.</span>}
-              {choosable.map((d) => (
-                <label key={d.id} className="check">
-                  <input
-                    type="checkbox"
-                    checked={c.docIds.includes(d.id)}
-                    onChange={() => toggleDoc(c, d.id)}
-                  />
-                  {d.name}
-                  {d.sample && <span className="badge">Sample</span>}
-                  {d.status === "processing" && <span className="muted">(reading…)</span>}
-                  {d.status === "ready_text" && <span className="muted">(quick text, tables still parsing)</span>}
-                </label>
-              ))}
-            </div>
-
-            <label>Output format</label>
-            <div className="row">
-              <select value={c.format} onChange={(e) => patch(c.id, { format: e.target.value })}>
-                {FORMATS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-              </select>
-              {c.format === "custom" && (
-                <input
-                  placeholder="Describe the format"
-                  value={c.custom}
-                  onChange={(e) => patch(c.id, { custom: e.target.value })}
-                />
-              )}
-              <button className="primary" disabled={c.loading} onClick={() => run(c)}>
-                {c.loading ? "Extracting…" : "Extract"}
-              </button>
-            </div>
-
-            {c.error && <div className="warn">{c.error}</div>}
-            {c.result && (
-              <ResultBoundary result={c.result}>
-                <Result result={c.result} />
-              </ResultBoundary>
-            )}
-          </section>
+          <ExtractionCard
+            key={c.id}
+            card={c}
+            index={idx}
+            docs={choosable}
+            canRemove={cards.length > 1}
+            onPatch={(p) => patch(c.id, p)}
+            onRun={() => run(c)}
+            onRemove={() => setCards((cs) => cs.filter((x) => x.id !== c.id))}
+            onCopied={() => notify("Copied to clipboard")}
+          />
         ))}
 
         <div className="footer">
-          <button onClick={() => setCards((cs) => [...cs, newCard()])}>+ Add more information</button>
-          {cards.length > 1 && <button className="primary" onClick={runAll}>Extract all</button>}
+          <button className="btn btn-dashed" onClick={() => setCards((cs) => [...cs, newCard()])}>
+            <Plus size={16} />
+            Add extraction
+          </button>
+          {cards.length > 1 && (
+            <button className="btn btn-primary" onClick={runAll}>
+              <Sparkles size={16} />
+              Extract all
+            </button>
+          )}
         </div>
       </main>
+
+      <Toast toast={toast} />
     </div>
   );
 }
